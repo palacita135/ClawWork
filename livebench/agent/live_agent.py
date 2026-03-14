@@ -390,17 +390,24 @@ class LiveAgent:
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
 
-    async def _ainvoke_with_retry(self, messages: List[Dict[str, str]], timeout: float = 120.0) -> Any:
+    async def _ainvoke_with_retry(
+            self,
+            messages: List[Dict[str, str]],
+            runnable: Any = None,
+            timeout: int = 60,
+            config: Optional[Dict[str, Any]] = None
+        ) -> Any:
         """
-        Agent invocation with retry, timeout, and token tracking
-        
+        Invoke the model with retry logic and token tracking.
+
         Args:
-            messages: List of messages to send to the agent
-            timeout: Maximum time in seconds to wait for API response (default: 120s)
+            messages: List of message dictionaries
+            runnable: Optional LangChain runnable (e.g., model with tools bound)
+            timeout: Timeout in seconds
+            config: Optional LangChain config
             
         Returns:
             Agent response
-            
         Raises:
             Exception: If all retry attempts fail
         """
@@ -426,10 +433,11 @@ class LiveAgent:
                         # LangChain HumanMessage can accept both string and list[dict] content
                         lc_messages.append(HumanMessage(content=content))
 
-                # Invoke the model with explicit timeout
+                # Invoke the model or runnable with explicit timeout
+                invoke_target = runnable if runnable is not None else self.model
                 try:
                     response = await asyncio.wait_for(
-                        self.agent.ainvoke(lc_messages),
+                        invoke_target.ainvoke(lc_messages),
                         timeout=timeout
                     )
                 except asyncio.TimeoutError:
@@ -989,6 +997,102 @@ class LiveAgent:
                     pass
 
         return already_done_dates, already_used_task_ids
+
+    async def run_production_task(self, task_dict: Dict[str, Any]) -> bool:
+        """
+        Run a single production task from the bridge.
+        
+        Args:
+            task_dict: Task definition from the production bridge.
+            
+        Returns:
+            True if task was completed successfully, False otherwise.
+        """
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        self.logger.terminal_print(f"\n{'='*60}")
+        self.logger.terminal_print(f"🚀 PRODUCTION TASK: {task_dict.get('name', 'Unknown')}")
+        self.logger.terminal_print(f"💰 Reward: ${task_dict.get('reward_usd', 0):.2f}")
+        self.logger.terminal_print(f"{'='*60}\n")
+
+        # Set up logging
+        self._setup_logging(date_str)
+        self.logger.setup_terminal_log(date_str)
+        
+        self.current_date = date_str
+        self.current_task = task_dict
+        
+        # Start tracking costs
+        self.economic_tracker.start_task(task_dict.get('task_id', 'prod_task'), date=date_str)
+        
+        try:
+            # Update tool state
+            from livebench.tools.direct_tools import set_global_state as set_tool_state
+            set_tool_state(
+                signature=self.signature,
+                economic_tracker=self.economic_tracker,
+                task_manager=self.task_manager,
+                evaluator=self.evaluator,
+                current_date=date_str,
+                current_task=self.current_task,
+                data_path=self.data_path,
+                supports_multimodal=self.supports_multimodal
+            )
+            
+            # Create agent with system prompt
+            economic_state = self.economic_tracker.get_summary()
+            system_prompt = get_live_agent_system_prompt(
+                date=date_str,
+                signature=self.signature,
+                economic_state=economic_state,
+                work_task=self.current_task,
+                max_steps=self.max_steps
+            )
+            
+            self.agent = self.model.bind_tools(self.tools)
+            
+            task_content = task_dict.get('description') or task_dict.get('prompt') or 'No description provided'
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Please complete this task: {task_content}"}
+            ]
+            
+            # Reasoning loop (simplified version of run_daily_session)
+            max_iterations = 15
+            activity_completed = False
+            
+            for iteration in range(max_iterations):
+                self.logger.terminal_print(f"\n🔄 Production Iteration {iteration + 1}/{max_iterations}")
+                response = await self._ainvoke_with_retry(messages, runnable=self.agent, timeout=self.api_timeout)
+                
+                agent_response = response.content if hasattr(response, 'content') else str(response)
+                self.logger.terminal_print(f"💭 Agent: {agent_response[:200]}...")
+                
+                if hasattr(response, 'tool_calls') and response.tool_calls:
+                    messages.append({"role": "assistant", "content": agent_response})
+                    for tool_call in response.tool_calls:
+                        tool_name = tool_call.get('name', 'unknown')
+                        tool_args = tool_call.get('args', {})
+                        self.logger.terminal_print(f"🔧 Calling: {tool_name}")
+                        
+                        tool_result = await self._execute_tool(tool_name, tool_args)
+                        
+                        if tool_name == 'submit_work':
+                            self.economic_tracker.end_task()
+                            activity_completed = True
+                            
+                        tool_message = format_tool_result_message(tool_name, tool_result, tool_args, activity_completed)
+                        messages.append(tool_message)
+                        
+                    if activity_completed:
+                        break
+                else:
+                    break
+                    
+            return activity_completed
+            
+        except Exception as e:
+            self.logger.error(f"Production task failed: {str(e)}")
+            return False
 
     async def run_date_range(self, init_date: str, end_date: str) -> None:
         """

@@ -10,6 +10,7 @@ fastmcp>=0.2.0
 
 # LangChain and OpenAI
 langchain>=0.1.0
+langchain-core>=0.1.0
 langchain-openai>=0.0.2
 langchain-mcp-adapters>=0.1.0
 langgraph>=0.2.0
@@ -23,9 +24,9 @@ python-dotenv>=1.0.0
 
 # HTTP requests
 requests>=2.31.0
+httpx>=0.25.0
 
 # Sandbox backends (BoxLite default, E2B fallback)
-boxlite[sync]>=0.6.0
 e2b-code-interpreter>=1.0.0
 
 # Web search APIs
